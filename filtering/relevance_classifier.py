@@ -1,9 +1,8 @@
 """Relevance classification scaffold for aging theory detection.
 
-This module will combine heuristic token checks with ML or LLM classifiers such
-as cross-encoder/ms-marco-MiniLM-L-6-v2 to decide whether a record discusses an
-aging theory. Outputs are structured JSON-like decisions with confidence and
-rationales for auditing.
+This module combines heuristic token checks with an OpenAI LLM confirmation
+step to decide whether a record discusses an aging theory. Outputs are
+structured JSON-like decisions with confidence and rationales for auditing.
 """
 
 from __future__ import annotations
@@ -17,9 +16,14 @@ from pathlib import Path
 from typing import Iterable, List, Optional
 
 try:  # pragma: no cover - optional dependency
-    from transformers import pipeline
+    from openai import OpenAI
+    try:  # OpenAIError lives in different modules depending on package version
+        from openai import OpenAIError  # type: ignore
+    except Exception:  # pragma: no cover
+        from openai.error import OpenAIError  # type: ignore
 except Exception:  # pragma: no cover - graceful degradation
-    pipeline = None  # type: ignore
+    OpenAI = None  # type: ignore
+    OpenAIError = Exception  # type: ignore
 
 
 LOGGER = logging.getLogger(__name__)
@@ -69,52 +73,48 @@ class _HeuristicOutcome:
 
 
 class RelevanceClassifier:
-    """Two-stage classifier that combines heuristics with an ML confirmation."""
+    """Two-stage classifier that combines heuristics with an LLM confirmation."""
 
     def __init__(
         self,
         log_path: Optional[Path | str] = None,
-        zero_shot_model: str = "facebook/bart-large-mnli",
+        openai_model: str = "gpt-4o-mini",
         acceptance_threshold: float = 0.65,
         uncertainty_margin: float = 0.55,
     ) -> None:
         self.log_path = Path(log_path or "logs/corpus_seed.jsonl")
-        self.zero_shot_model = zero_shot_model
+        self.openai_model = openai_model
         self.acceptance_threshold = acceptance_threshold
         self.uncertainty_margin = uncertainty_margin
-        self._zero_shot = None
+        self._openai_client: Optional[OpenAI] = None
         self.summary = {
             "total": 0,
             "accepted": 0,
             "rejected": 0,
             "uncertain": 0,
             "heuristic_rejects": 0,
-            "ml_rejects": 0,
+            "llm_rejects": 0,
         }
         self.rejection_reasons: Counter[str] = Counter()
 
-    def _ensure_zero_shot(self) -> Optional[object]:
-        """Load a zero-shot classifier if the dependency is available."""
+    def _ensure_openai_client(self) -> Optional[OpenAI]:
+        """Initialise an OpenAI client if the dependency is installed."""
 
-        if self._zero_shot is not None:
-            return self._zero_shot
+        if self._openai_client is not None:
+            return self._openai_client
 
-        if pipeline is None:
+        if OpenAI is None:
             LOGGER.warning(
-                "transformers pipeline is unavailable; classification will rely on heuristics only."
+                "openai package is unavailable; classification will rely on heuristics only."
             )
             return None
 
         try:
-            self._zero_shot = pipeline(
-                "zero-shot-classification",
-                model=self.zero_shot_model,
-                truncation=True,
-            )
-        except Exception as exc:  # pragma: no cover - download/runtime errors
-            LOGGER.warning("Failed to initialise zero-shot pipeline: %s", exc)
-            self._zero_shot = None
-        return self._zero_shot
+            self._openai_client = OpenAI()
+        except Exception as exc:  # pragma: no cover - runtime errors
+            LOGGER.warning("Failed to initialise OpenAI client: %s", exc)
+            self._openai_client = None
+        return self._openai_client
 
     def _heuristic_pass(self, record: dict) -> _HeuristicOutcome:
         """Apply keyword heuristics to detect likely aging-theory documents."""
@@ -134,21 +134,104 @@ class RelevanceClassifier:
         passed = not failure_reasons
         return _HeuristicOutcome(passed=passed, key_terms=key_terms, failure_reasons=failure_reasons)
 
-    def _run_zero_shot(self, text: str) -> Optional[dict]:
-        """Execute zero-shot classification when the model is available."""
+    def _call_openai_classifier(self, record: dict, heuristic_terms: List[str]) -> Optional[dict]:
+        """Send a structured relevance prompt to an OpenAI LLM."""
 
-        if not text:
+        client = self._ensure_openai_client()
+        if client is None:
             return None
 
-        classifier = self._ensure_zero_shot()
-        if classifier is None:
+        title = (record.get("title") or "").strip()
+        abstract = (record.get("abstract") or "").strip()
+
+        if not (title or abstract):
+            LOGGER.debug("Skipping LLM stage because the record lacks title and abstract")
             return None
 
-        return classifier(
-            text,
-            candidate_labels=["relevant", "not relevant"],
-            hypothesis_template="This document is {} to aging theory research.",
+        key_term_fragment = ", ".join(heuristic_terms) if heuristic_terms else "(none)"
+        user_prompt = (
+            "You are reviewing scientific records about theories of biological aging.\n"
+            "Decide whether the document discusses conceptual models, hypotheses, or formal theories of aging.\n"
+            "Reject documents focused solely on specific mechanisms, biomarkers, or single tissues without broader theoretical framing.\n"
+            "Return a strict JSON object with keys decision (true/false/uncertain), confidence (0-1 float), rationale (one sentence), and key_terms (list of short phrases).\n"
+            "Use uncertainty when evidence is ambiguous.\n"
+            "Title: "
+            f"{title or 'N/A'}\n"
+            "Abstract: "
+            f"{abstract or 'N/A'}\n"
+            "Heuristic terms observed: {key_term_fragment}"
         )
+
+        try:
+            response = client.chat.completions.create(  # type: ignore[attr-defined]
+                model=self.openai_model,
+                temperature=0,
+                response_format={"type": "json_object"},
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are a careful research assistant."
+                            " Respond only with valid JSON for downstream ingestion."
+                        ),
+                    },
+                    {"role": "user", "content": user_prompt},
+                ],
+            )
+        except AttributeError:
+            try:
+                completion = client.responses.create(  # type: ignore[attr-defined]
+                    model=self.openai_model,
+                    temperature=0,
+                    response_format={"type": "json_object"},
+                    input=[
+                        {
+                            "role": "system",
+                            "content": (
+                                "You are a careful research assistant."
+                                " Respond only with valid JSON for downstream ingestion."
+                            ),
+                        },
+                        {"role": "user", "content": user_prompt},
+                    ],
+                )
+            except Exception as exc:  # pragma: no cover - runtime/API errors
+                LOGGER.warning("OpenAI responses endpoint failed: %s", exc)
+                return None
+
+            if hasattr(completion, "output_text") and completion.output_text:  # type: ignore[attr-defined]
+                message_content = completion.output_text  # type: ignore[assignment]
+            else:
+                output = completion.output if hasattr(completion, "output") else None
+                if not output:
+                    LOGGER.warning("OpenAI responses endpoint returned empty output")
+                    return None
+                try:
+                    message_content = output[0]["content"][0]["text"]  # type: ignore[index]
+                except Exception as exc:  # pragma: no cover - schema drift
+                    LOGGER.warning("Unexpected responses payload: %s", exc)
+                    return None
+        except OpenAIError as exc:  # pragma: no cover - API errors
+            LOGGER.warning("OpenAI classification request failed: %s", exc)
+            return None
+        else:
+            try:
+                message_content = response.choices[0].message.content  # type: ignore[index]
+            except Exception as exc:  # pragma: no cover - schema drift
+                LOGGER.warning("Unexpected chat completion payload: %s", exc)
+                return None
+
+        if not message_content:
+            LOGGER.warning("OpenAI classification returned empty message content")
+            return None
+
+        try:
+            parsed = json.loads(message_content)
+        except json.JSONDecodeError as exc:
+            LOGGER.warning("Failed to parse OpenAI JSON payload: %s", exc)
+            return None
+
+        return parsed
 
     def _log_decision(self, entry: dict) -> None:
         """Persist a structured decision log for downstream ingest steps."""
@@ -164,9 +247,8 @@ class RelevanceClassifier:
         for record in records:
             self.summary["total"] += 1
             heuristic = self._heuristic_pass(record)
-            text = _extract_text(record)
 
-            ml_payload = None
+            llm_payload = None
             decision = "false"
             confidence = 0.0
             rationale_parts = []
@@ -176,48 +258,88 @@ class RelevanceClassifier:
                 rationale_parts.append(
                     "Heuristic tokens detected: " + ", ".join(heuristic.key_terms)
                 )
-                ml_payload = self._run_zero_shot(text)
-                if ml_payload is None:
+                llm_payload = self._call_openai_classifier(record, heuristic.key_terms)
+                if llm_payload is None or not isinstance(llm_payload, dict):
                     decision = "uncertain"
                     confidence = 0.5
                     rationale_parts.append(
-                        "Zero-shot classifier unavailable; keeping record for manual review."
+                        "OpenAI classifier unavailable or returned invalid payload; keeping record for manual review."
                     )
                     self.summary["uncertain"] += 1
-                    reason = "ml_unavailable"
+                    reason = "llm_unavailable" if llm_payload is None else "llm_invalid_payload"
                 else:
-                    top_label = ml_payload["labels"][0]
-                    top_score = float(ml_payload["scores"][0])
-                    if top_label == "relevant" and top_score >= self.acceptance_threshold:
+                    decision_raw = str(llm_payload.get("decision", "")).strip().lower()
+                    try:
+                        confidence = float(llm_payload.get("confidence", 0.0))
+                    except (TypeError, ValueError):
+                        confidence = 0.0
+                    rationale_text = str(llm_payload.get("rationale", "")).strip()
+                    if rationale_text:
+                        rationale_parts.append(rationale_text)
+                    llm_terms = llm_payload.get("key_terms") or []
+                    if isinstance(llm_terms, list):
+                        for term in llm_terms:
+                            if isinstance(term, str) and term not in heuristic.key_terms:
+                                heuristic.key_terms.append(term)
+                    heuristic.key_terms = list(dict.fromkeys(heuristic.key_terms))
+
+                    confidence = max(0.0, min(1.0, confidence))
+
+                    if decision_raw == "true" and confidence >= self.acceptance_threshold:
                         decision = "true"
-                        confidence = top_score
                         rationale_parts.append(
-                            f"Zero-shot classifier predicted relevance with score {top_score:.2f}."
+                            f"OpenAI classifier predicted relevance with confidence {confidence:.2f}."
                         )
                         self.summary["accepted"] += 1
-                    elif top_score < self.uncertainty_margin:
-                        decision = "uncertain"
-                        confidence = top_score
-                        rationale_parts.append(
-                            f"Classifier confidence {top_score:.2f} below uncertainty margin."
-                        )
-                        self.summary["uncertain"] += 1
-                        reason = "ml_low_confidence"
-                    else:
+                    elif decision_raw == "false" and confidence >= self.uncertainty_margin:
                         decision = "false"
-                        confidence = top_score
                         rationale_parts.append(
-                            f"Zero-shot classifier predicted non-relevance with score {top_score:.2f}."
+                            f"OpenAI classifier predicted non-relevance with confidence {confidence:.2f}."
                         )
                         self.summary["rejected"] += 1
-                        self.summary["ml_rejects"] += 1
-                        reason = "ml_not_relevant"
+                        self.summary["llm_rejects"] += 1
+                        reason = "llm_not_relevant"
+                    elif confidence < self.uncertainty_margin:
+                        decision = "uncertain"
+                        rationale_parts.append(
+                            f"Classifier confidence {confidence:.2f} below uncertainty margin."
+                        )
+                        self.summary["uncertain"] += 1
+                        reason = "llm_low_confidence"
+                    elif decision_raw == "true":
+                        decision = "uncertain"
+                        rationale_parts.append(
+                            f"Classifier marked relevant but score {confidence:.2f} below acceptance threshold {self.acceptance_threshold:.2f}."
+                        )
+                        self.summary["uncertain"] += 1
+                        reason = "llm_below_acceptance"
+                    elif decision_raw == "false":
+                        decision = "false"
+                        rationale_parts.append(
+                            f"OpenAI classifier predicted non-relevance with confidence {confidence:.2f}."
+                        )
+                        self.summary["rejected"] += 1
+                        self.summary["llm_rejects"] += 1
+                        reason = "llm_not_relevant"
+                    elif decision_raw == "uncertain":
+                        decision = "uncertain"
+                        rationale_parts.append("OpenAI classifier flagged the record as uncertain.")
+                        self.summary["uncertain"] += 1
+                        reason = "llm_flagged_uncertain"
+                    else:
+                        # Any unexpected label is treated as uncertain for safety.
+                        decision = "uncertain"
+                        rationale_parts.append(
+                            f"Received unexpected decision '{decision_raw}'; marking as uncertain."
+                        )
+                        self.summary["uncertain"] += 1
+                        reason = "llm_unexpected_decision"
             else:
                 decision = "false"
                 confidence = 0.2
                 missing_parts = ", ".join(heuristic.failure_reasons)
                 rationale_parts.append(
-                    f"Failed heuristic checks ({missing_parts}); skipping ML stage."
+                    f"Failed heuristic checks ({missing_parts}); skipping LLM stage."
                 )
                 self.summary["rejected"] += 1
                 self.summary["heuristic_rejects"] += 1
@@ -234,11 +356,12 @@ class RelevanceClassifier:
             )
             results.append(result)
 
-            if ml_payload is not None:
+            if llm_payload is not None:
                 sanitized_payload = {
-                    "labels": list(ml_payload.get("labels", [])),
-                    "scores": [float(score) for score in ml_payload.get("scores", [])],
-                    "sequence": ml_payload.get("sequence"),
+                    "decision": llm_payload.get("decision"),
+                    "confidence": llm_payload.get("confidence"),
+                    "rationale": llm_payload.get("rationale"),
+                    "key_terms": llm_payload.get("key_terms"),
                 }
             else:
                 sanitized_payload = None
@@ -254,7 +377,7 @@ class RelevanceClassifier:
                         "passed": heuristic.passed,
                         "failure_reasons": heuristic.failure_reasons,
                     },
-                    "ml_payload": sanitized_payload,
+                    "llm_payload": sanitized_payload,
                     "rejection_reason": reason,
                 },
             }
