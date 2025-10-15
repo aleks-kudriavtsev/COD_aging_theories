@@ -259,14 +259,14 @@ class RelevanceClassifier:
                     "Heuristic tokens detected: " + ", ".join(heuristic.key_terms)
                 )
                 llm_payload = self._call_openai_classifier(record, heuristic.key_terms)
-                if llm_payload is None:
+                if llm_payload is None or not isinstance(llm_payload, dict):
                     decision = "uncertain"
                     confidence = 0.5
                     rationale_parts.append(
                         "OpenAI classifier unavailable or returned invalid payload; keeping record for manual review."
                     )
                     self.summary["uncertain"] += 1
-                    reason = "llm_unavailable"
+                    reason = "llm_unavailable" if llm_payload is None else "llm_invalid_payload"
                 else:
                     decision_raw = str(llm_payload.get("decision", "")).strip().lower()
                     try:
